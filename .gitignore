@@ -4,6 +4,7 @@
 *.rej
 *.orig
 */build
+/.idea
 build/
 snakebite.egg-info/
 MANIFEST
