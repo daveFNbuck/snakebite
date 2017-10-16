@@ -14,7 +14,6 @@
 # the License.
 import unittest2
 import os
-import pwd
 import json
 import sys
 import traceback
@@ -24,6 +23,7 @@ from mock import MagicMock, patch, mock_open
 from snakebite.config import HDFSConfig
 from snakebite.commandlineparser import Commands, CommandLineParser
 from snakebite.namenode import Namenode
+from snakebite.platformutils import get_current_username
 
 from config_test import ConfigTest
 
@@ -31,7 +31,7 @@ class CommandLineParserTest(unittest2.TestCase):
 
     def setUp(self):
         self.parser = CommandLineParser()
-        self.default_dir = os.path.join("/user", pwd.getpwuid(os.getuid())[0])
+        self.default_dir = os.path.join("/user", get_current_username())
 
     def test_general_options(self):
         parser = self.parser
@@ -660,7 +660,7 @@ class MockParseArgs(object):
 class CommandLineParserInternalConfigTest(unittest2.TestCase):
     def setUp(self):
         self.parser = CommandLineParser()
-        self.default_dir = os.path.join("/user", pwd.getpwuid(os.getuid())[0])
+        self.default_dir = os.path.join("/user", get_current_username())
 
 
     def assert_namenode_spec(self, host, port, version=None):
@@ -818,7 +818,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.args = MockParseArgs()
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", 54310, 9)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     @patch("os.path.exists")
     def test_read_config_snakebiterc_ha_valid(self, exists_mock):
@@ -829,7 +829,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", 54310, 9)
             self.assert_namenodes_spec("foobar2", 54310, 9)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     @patch("os.path.exists")
     def test_read_config_snakebiterc_invalid(self, exists_mock):
@@ -852,7 +852,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.args = MockParseArgs()
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 11)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     @patch("os.path.exists")
     def test_read_config_snakebiterc_noport_ha_valid(self, exists_mock):
@@ -863,7 +863,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 100)
             self.assert_namenodes_spec("foobar2", Namenode.DEFAULT_PORT, 100)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
 
     valid_snake_noport_nov_one_rc = {"namenode": "foobar"}
@@ -878,7 +878,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.args = MockParseArgs()
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     @patch("os.path.exists")
     def test_read_config_snakebiterc_noport_nov_ha_valid(self, exists_mock):
@@ -889,7 +889,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
             self.assert_namenodes_spec("foobar2", Namenode.DEFAULT_PORT, Namenode.DEFAULT_VERSION)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     valid_snake_noport_mix_rc = [{"namenode": "foobar", "version": 100},
                                  {"namenode": "foobar2", "port": 66}]
@@ -903,7 +903,7 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.parser.read_config()
             self.assert_namenodes_spec("foobar", Namenode.DEFAULT_PORT, 100)
             self.assert_namenodes_spec("foobar2", 66, Namenode.DEFAULT_VERSION)
-            self.assertEquals(self.parser.args.usetrash, HDFSConfig.use_trash)
+            self.assertEquals(self.parser.args.usetrash, self.parser.configs['use_trash'])
 
     valid_snake_one_rc_v2 = {
                                 "config_version": 2,
@@ -995,6 +995,30 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
             self.assert_namenodes_spec("foobar5", 54310, Namenode.DEFAULT_VERSION)
 
 
+    valid_user_rc_v2 = {
+        "config_version": 2,
+        "use_trash": True,
+        "user": "hdfs_user",
+        "namenodes": [
+            {"host": "foobar4", "version": 100},
+            {"host": "foobar5", "port": 54310}
+        ]
+    }
+
+    @patch("os.path.exists")
+    def test_read_config_snakebiterc_user_valid_v2(self, exists_mock):
+        m = mock_open(read_data=json.dumps(self.valid_user_rc_v2))
+
+        with patch("snakebite.commandlineparser.open", m, create=True):
+            self.parser.args = MockParseArgs()
+            self.parser.read_config()
+            self.parser.setup_client()
+            self.assertTrue(self.parser.args.usetrash)
+            self.assertEquals(self.parser.client.effective_user, "hdfs_user")
+            self.assert_namenodes_spec("foobar4", Namenode.DEFAULT_PORT, 100)
+            self.assert_namenodes_spec("foobar5", 54310, Namenode.DEFAULT_VERSION)
+
+
     def test_cl_default_port(self):
         self.parser.args = MockParseArgs(dir=["hdfs://foobar/user/rav"],
                                          single_arg="hdfs://foobar/user/rav",
@@ -1015,7 +1039,8 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
 
     def _revert_hdfs_try_paths(self):
         # Make sure HDFSConfig is in vanilla state
-        HDFSConfig.use_trash = False
+        self.parser.configs['use_trash'] = False
+
         HDFSConfig.hdfs_try_paths = ConfigTest.original_hdfs_try_path
         HDFSConfig.core_try_paths = ConfigTest.original_core_try_path
 
@@ -1068,6 +1093,20 @@ class CommandLineParserInternalConfigTest(unittest2.TestCase):
         finally:
             self._revert_hdfs_try_paths()
 
+    @patch('os.environ.get')
+    def test_use_datanode_hostname(self, environ_get):
+        environ_get.return_value = False
+        # no snakebiterc
+        # read external config (hdfs-site, core-site)
+        self.parser.args = MockParseArgs()
+        try:
+            HDFSConfig.core_try_paths = (ConfigTest.get_config_path('ha-core-site.xml'),)
+            HDFSConfig.hdfs_try_paths = (ConfigTest.get_config_path('use-datanode-hostname-hdfs-site.xml'),)
+            self.parser.init()
+
+            self.assertTrue(self.parser.client.use_datanode_hostname)
+        finally:
+            self._revert_hdfs_try_paths()
 
 
 class CommandLineParserExecuteTest(unittest2.TestCase):

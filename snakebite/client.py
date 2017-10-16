@@ -15,17 +15,21 @@
 
 import snakebite.protobuf.ClientNamenodeProtocol_pb2 as client_proto
 import snakebite.glob as glob
-from snakebite.errors import RequestError
-from snakebite.service import RpcService
-from snakebite.errors import FileAlreadyExistsException
-from snakebite.errors import FileNotFoundException
-from snakebite.errors import DirectoryException
-from snakebite.errors import FileException
-from snakebite.errors import InvalidInputException
-from snakebite.errors import OutOfNNException
+from snakebite.platformutils import get_current_username
 from snakebite.channel import DataXceiverChannel
 from snakebite.config import HDFSConfig
+from snakebite.errors import (
+    ConnectionFailureException,
+    DirectoryException,
+    FileAlreadyExistsException,
+    FileException,
+    FileNotFoundException,
+    InvalidInputException,
+    OutOfNNException,
+    RequestError,
+    FatalException, TransientException)
 from snakebite.namenode import Namenode
+from snakebite.service import RpcService
 
 import Queue
 import zlib
@@ -33,7 +37,7 @@ import bz2
 import logging
 import os
 import os.path
-import pwd
+import posixpath
 import fnmatch
 import inspect
 import socket
@@ -41,6 +45,7 @@ import errno
 import time
 import re
 import sys
+import random
 
 if sys.version_info[0] == 3:
     long = int
@@ -81,7 +86,9 @@ class Client(object):
         3: "s"
     }
 
-    def __init__(self, host, port=Namenode.DEFAULT_PORT, hadoop_version=Namenode.DEFAULT_VERSION, use_trash=False, effective_user=None):
+    def __init__(self, host, port=Namenode.DEFAULT_PORT, hadoop_version=Namenode.DEFAULT_VERSION,
+                 use_trash=False, effective_user=None, use_sasl=False, hdfs_namenode_principal=None,
+                 sock_connect_timeout=10000, sock_request_timeout=10000, use_datanode_hostname=False):
         '''
         :param host: Hostname or IP address of the NameNode
         :type host: string
@@ -93,18 +100,34 @@ class Client(object):
         :type use_trash: boolean
         :param effective_user: Effective user for the HDFS operations (default: None - current user)
         :type effective_user: string
+        :param use_sasl: Use SASL authentication or not
+        :type use_sasl: boolean
+        :param hdfs_namenode_principal: Kerberos principal to use for HDFS
+        :type hdfs_namenode_principal: string
+        :param sock_connect_timeout: Socket connection timeout in seconds
+        :type sock_connect_timeout: int
+        :param sock_request_timeout: Request timeout in seconds
+        :type sock_request_timeout: int
+        :param use_datanode_hostname: Use hostname instead of IP address to commuicate with datanodes
+        :type use_datanode_hostname: boolean
         '''
         if hadoop_version < 9:
-            raise Exception("Only protocol versions >= 9 supported")
+            raise FatalException("Only protocol versions >= 9 supported")
 
         self.host = host
         self.port = port
+        self.use_sasl = use_sasl
+        self.hdfs_namenode_principal = hdfs_namenode_principal
         self.service_stub_class = client_proto.ClientNamenodeProtocol_Stub
-        self.service = RpcService(self.service_stub_class, self.port, self.host, hadoop_version, effective_user)
+        self.service = RpcService(self.service_stub_class, self.port, self.host, hadoop_version,
+                                  effective_user,self.use_sasl, self.hdfs_namenode_principal,
+                                  sock_connect_timeout, sock_request_timeout)
         self.use_trash = use_trash
         self.trash = self._join_user_path(".Trash")
+        self._server_defaults = None
+        self.use_datanode_hostname = use_datanode_hostname
 
-        log.debug("Created client for %s:%s with trash=%s" % (host, port, use_trash))
+        log.debug("Created client for %s:%s with trash=%s and sasl=%s" % (host, port, use_trash, use_sasl))
 
     def ls(self, paths, recurse=False, include_toplevel=False, include_children=True):
         ''' Issues 'ls' command and returns a list of maps that contain fileinfo
@@ -500,11 +523,11 @@ class Client(object):
             else:
                 suffix_path = path[1:]
 
-            trash_path = os.path.join(self.trash, "Current", suffix_path)
+            trash_path = posixpath.join(self.trash, "Current", suffix_path)
             if trash_path.endswith("/"):
                 trash_path = trash_path[:-1]
 
-            base_trash_path = os.path.join(self.trash, "Current", os.path.dirname(suffix_path))
+            base_trash_path = posixpath.join(self.trash, "Current", posixpath.dirname(suffix_path))
             if base_trash_path.endswith("/"):
                 base_trash_path = base_trash_path[:-1]
 
@@ -522,7 +545,7 @@ class Client(object):
                 if result['result']:
                     result['message'] = ". Moved %s to %s" % (path, trash_path)
                     return result
-            raise Exception("Failed to move to trash: %s" % path)
+            raise FatalException("Failed to move to trash: %s" % path)
         else:
             request = client_proto.DeleteRequestProto()
             request.src = path
@@ -535,8 +558,8 @@ class Client(object):
             return False
         if path.startswith(self.trash):
             return False  # Path already in trash
-        if os.path.dirname(self.trash).startswith(path):
-            raise Exception("Cannot move %s to the trash, as it contains the trash" % path)
+        if posixpath.dirname(self.trash).startswith(path):
+            raise FatalException("Cannot move %s to the trash, as it contains the trash" % path)
 
         return True
 
@@ -613,7 +636,7 @@ class Client(object):
             response = self._create_file(path, replication, blocksize, overwrite=True)
         else:
             # Check if the parent directory exists
-            parent = self._get_file_info(os.path.dirname(path))
+            parent = self._get_file_info(posixpath.dirname(path))
             if not parent:
                 raise DirectoryException("touchz: `%s': No such file or directory" % path)
             else:
@@ -717,7 +740,7 @@ class Client(object):
         if not self.base_source:
             # base_source is shared for whole dir tree, and can
             # be computed only once per dir tree
-            self.base_source = os.path.dirname(path)
+            self.base_source = posixpath.dirname(path)
             self.base_source = self.base_source if self.base_source.endswith("/") else self.base_source + "/"
 
         # If input destination is an existing directory, include toplevel
@@ -742,7 +765,7 @@ class Client(object):
         # Source is a file
         elif self._is_file(node):
             temporary_target = "%s._COPYING_" % target
-            f = open(temporary_target, 'w')
+            f = open(temporary_target, 'wb')
             try:
                 for load in self._read_file(path, node, tail_only=False, check_crc=check_crc):
                     f.write(load)
@@ -787,7 +810,7 @@ class Client(object):
                     elif not load['error'] is '':
                         if os.path.isfile(temporary_target):
                             os.remove(temporary_target)
-                        raise Exception(load['error'])
+                        raise FatalException(load['error'])
                 if newline and load['response']:
                     f.write("\n")
             yield {"path": dst, "response": '', "result": True, "error": load['error'], "source_path": path}
@@ -855,32 +878,43 @@ class Client(object):
                 "block_replication": node.block_replication,
                 "blocksize": node.blocksize}
 
-    def tail(self, path, append=False):
+    def tail(self, path, tail_length=1024, append=False):
         # Note: append is currently not implemented.
-        ''' Show the last 1KB of the file.
+        ''' Show the end of the file - default 1KB, supports up to the Hadoop block size.
 
         :param path: Path to read
         :type path: string
-        :param f: Shows appended data as the file grows.
-        :type f: boolean
+        :param tail_length: The length to read from the end of the file - default 1KB, up to block size.
+        :type tail_length: int
+        :param append: Currently not implemented
+        :type append: bool
         :returns: a generator that yields strings
         '''
+        #TODO: Make tail support multiple files at a time, like most other methods do
+
         if not path:
             raise InvalidInputException("tail: no path given")
 
-        processor = lambda path, node, tail_only=True, append=append: self._handle_tail(path, node, tail_only, append)
+        block_size = self.serverdefaults()['blockSize']
+        if tail_length > block_size:
+            raise InvalidInputException("tail: currently supports length up to the block size (%d)" % (block_size,))
+
+        if tail_length <= 0:
+            raise InvalidInputException("tail: tail_length cannot be less than or equal to zero")
+
+        processor = lambda path, node: self._handle_tail(path, node, tail_length, append)
         for item in self._find_items([path], processor, include_toplevel=True,
                                      include_children=False, recurse=False):
             if item:
                 yield item
 
-    def _handle_tail(self, path, node, tail_only, append):
+    def _handle_tail(self, path, node, tail_length, append):
         data = ''
-        for load in self._read_file(path, node, tail_only=True, check_crc=False):
+        for load in self._read_file(path, node, tail_only=True, check_crc=False, tail_length=tail_length):
             data += load
         # We read only the necessary packets but still
         # need to cut off at the packet level.
-        return data[max(0, len(data)-1024):len(data)]
+        return data[max(0, len(data)-tail_length):len(data)]
 
     def test(self, path, exists=False, directory=False, zero_length=False):
         '''Test if a path exist, is a directory or has zero length
@@ -890,7 +924,7 @@ class Client(object):
         :param exists: Check if the path exists
         :type exists: boolean
         :param directory: Check if the path is a directory
-        :type exists: boolean
+        :type directory: boolean
         :param zero_length: Check if the path is zero-length
         :type zero_length: boolean
         :returns: a boolean
@@ -988,22 +1022,36 @@ class Client(object):
             else:
                 yield {"path": path, "result": False, "error": "mkdir: `%s': File exists" % path}
 
-    def serverdefaults(self):
-        '''Get server defaults
+    def serverdefaults(self, force_reload=False):
+        '''Get server defaults, caching the results. If there are no results saved, or the force_reload flag is True,
+        it will query the HDFS server for its default parameter values. Otherwise, it will simply return the results
+        it has already queried.
 
-        :returns: dictionary
+        Note: This function returns a copy of the results loaded from the server, so you can manipulate or change
+        them as you'd like. If for any reason you need to change the results the client saves, you must access
+        the property client._server_defaults directly.
+
+        :param force_reload: Should the server defaults be reloaded even if they already exist?
+        :type force_reload: bool
+        :returns: dictionary with the following keys: blockSize, bytesPerChecksum, writePacketSize, replication, fileBufferSize, encryptDataTransfer, trashInterval, checksumType
 
         **Example:**
 
         >>> client.serverdefaults()
         [{'writePacketSize': 65536, 'fileBufferSize': 4096, 'replication': 1, 'bytesPerChecksum': 512, 'trashInterval': 0L, 'blockSize': 134217728L, 'encryptDataTransfer': False, 'checksumType': 2}]
+
         '''
-        request = client_proto.GetServerDefaultsRequestProto()
-        response = self.service.getServerDefaults(request).serverDefaults
-        return {'blockSize': response.blockSize, 'bytesPerChecksum': response.bytesPerChecksum,
+
+        if not self._server_defaults or force_reload:
+            request = client_proto.GetServerDefaultsRequestProto()
+            response = self.service.getServerDefaults(request).serverDefaults
+            self._server_defaults = {'blockSize': response.blockSize, 'bytesPerChecksum': response.bytesPerChecksum,
                 'writePacketSize': response.writePacketSize, 'replication': response.replication,
                 'fileBufferSize': response.fileBufferSize, 'encryptDataTransfer': response.encryptDataTransfer,
                 'trashInterval': response.trashInterval, 'checksumType': response.checksumType}
+
+        # return a copy, so if the user changes any values, they won't be saved in the client
+        return self._server_defaults.copy()
 
     def _is_directory(self, should_check, node):
         if not should_check:
@@ -1017,7 +1065,7 @@ class Client(object):
 
     def _get_full_path(self, path, node):
         if node.path:
-            return os.path.join(path, node.path)
+            return posixpath.join(path, node.path)
         else:
             return path
 
@@ -1047,17 +1095,18 @@ class Client(object):
 
         return self.service.complete(request)
 
-    def _read_file(self, path, node, tail_only, check_crc):
+    def _read_file(self, path, node, tail_only, check_crc, tail_length=1024):
         length = node.length
 
         request = client_proto.GetBlockLocationsRequestProto()
         request.src = path
         request.length = length
 
-        if tail_only:  # Only read last KB
-            request.offset = max(0, length - 1024)
+        if tail_only:  # Only read last part, default is 1KB
+            request.offset = max(0, length - tail_length)
         else:
             request.offset = long(0)
+
         response = self.service.getBlockLocations(request)
 
         if response.locations.fileLength == 0:  # Can't read empty file
@@ -1065,6 +1114,7 @@ class Client(object):
         lastblock = response.locations.lastBlock
 
         if tail_only:
+            # we assume that tail_length <= default block size due to check in Client.tail
             if lastblock.b.blockId == response.locations.blocks[0].b.blockId:
                 num_blocks_tail = 1  # Tail is on last block
             else:
@@ -1077,11 +1127,12 @@ class Client(object):
             pool_id = block.b.poolId
             offset_in_block = 0
             block_token = block.blockToken
+
             if tail_only:
                 if num_blocks_tail == 2 and block.b.blockId != lastblock.b.blockId:
-                    offset_in_block = block.b.numBytes - (1024 - lastblock.b.numBytes)
+                    offset_in_block = block.b.numBytes - (tail_length - lastblock.b.numBytes)
                 elif num_blocks_tail == 1:
-                    offset_in_block = max(0, lastblock.b.numBytes - 1024)
+                    offset_in_block = max(0, lastblock.b.numBytes - tail_length)
 
             # Prioritize locations to read from
             locations_queue = Queue.PriorityQueue()  # Primitive queuing based on a node's past failure
@@ -1095,7 +1146,7 @@ class Client(object):
             successful_read = False
             while not locations_queue.empty():
                 location = locations_queue.get()[1]
-                host = location.id.ipAddr
+                host = location.id.hostName if self.use_datanode_hostname else location.id.ipAddr
                 port = int(location.id.xferPort)
                 data_xciever = DataXceiverChannel(host, port)
                 if data_xciever.connect():
@@ -1106,16 +1157,19 @@ class Client(object):
                             successful_read = True
                             yield load
                     except Exception as e:
-                        log.error(e)
+                        log.getChild('transient').error(e)
                         if not location.id.storageID in failed_nodes:
                             failed_nodes.append(location.id.storageID)
                         successful_read = False
                 else:
-                    raise Exception
+                    raise ConnectionFailureException(
+                        u"Failure to connect to data node at ({}:{})".format(
+                            host, port
+                            ))
                 if successful_read:
                     break
             if successful_read is False:
-                raise Exception("Failure to read block %s" % block.b.blockId)
+                raise TransientException("Failure to read block %s" % block.b.blockId)
 
     def _find_items(self, paths, processor, include_toplevel=False, include_children=False, recurse=False, check_nonexistence=False):
         ''' Request file info from the NameNode and call the processor on the node(s) returned
@@ -1138,7 +1192,7 @@ class Client(object):
         '''
 
         if not paths:
-            paths = [os.path.join("/user", pwd.getpwuid(os.getuid())[0])]
+            paths = [posixpath.join("/user", get_current_username())]
 
         # Expand paths if necessary (/foo/{bar,baz} --> ['/foo/bar', '/foo/baz'])
         paths = glob.expand_paths(paths)
@@ -1183,7 +1237,7 @@ class Client(object):
                         # Recurse into directories
                         if recurse and self._is_dir(node):
                             # Construct the full path before processing
-                            full_path = os.path.join(path, node.path)
+                            full_path = posixpath.join(path, node.path)
                             for item in self._find_items([full_path],
                                                          processor,
                                                          include_toplevel=False,
@@ -1253,7 +1307,7 @@ class Client(object):
                             yield item
                     elif rest:
                         # we have more rest, but it's not magic, which is either a file or a directory
-                        final_path = os.path.join(full_path, rest)
+                        final_path = posixpath.join(full_path, rest)
                         fi = self._get_file_info(final_path)
                         if fi and self._is_dir(fi.fs):
                             for n in self._get_dir_listing(final_path):
@@ -1288,14 +1342,14 @@ class Client(object):
         return self.service.getFileInfo(request)
 
     def _join_user_path(self, path):
-        return os.path.join("/user", pwd.getpwuid(os.getuid())[0], path)
+        return posixpath.join("/user", get_current_username(), path)
 
     def _remove_user_path(self, path):
-        dir_to_remove = os.path.join("/user", pwd.getpwuid(os.getuid())[0])
+        dir_to_remove = posixpath.join("/user", get_current_username())
         return path.replace(dir_to_remove+'/', "", 1)
 
     def _normalize_path(self, path):
-        return os.path.normpath(re.sub('/+', '/', path))
+        return posixpath.normpath(re.sub('/+', '/', path))
 
 class HAClient(Client):
     ''' Snakebite client with support for High Availability
@@ -1327,7 +1381,14 @@ class HAClient(Client):
                 else:
                     setattr(cls, name, cls._ha_return_method(meth))
 
-    def __init__(self, namenodes, use_trash=False, effective_user=None):
+    def _reset_retries(self):
+        log.debug("Resetting retries and failovers")
+        self.failovers = 0
+        self.retries = 0
+
+    def __init__(self, namenodes, use_trash=False, effective_user=None, use_sasl=False, hdfs_namenode_principal=None,
+                 max_failovers=15, max_retries=10, base_sleep=500, max_sleep=15000, sock_connect_timeout=10000,
+                 sock_request_timeout=10000, use_datanode_hostname=False):
         '''
         :param namenodes: Set of namenodes for HA setup
         :type namenodes: list
@@ -1335,56 +1396,129 @@ class HAClient(Client):
         :type use_trash: boolean
         :param effective_user: Effective user for the HDFS operations (default: None - current user)
         :type effective_user: string
+        :param use_sasl: Use SASL authentication or not
+        :type use_sasl: boolean
+        :param hdfs_namenode_principal: Kerberos principal to use for HDFS
+        :type hdfs_namenode_principal: string
+        :param max_retries: Number of failovers in case of connection issues
+        :type max_retries: int
+        :param max_retries: Max number of retries for failures
+        :type max_retries: int
+        :param base_sleep: Base sleep time for retries in milliseconds
+        :type base_sleep: int
+        :param max_sleep: Max sleep time for retries in milliseconds
+        :type max_sleep: int
+        :param sock_connect_timeout: Socket connection timeout in seconds
+        :type sock_connect_timeout: int
+        :param sock_request_timeout: Request timeout in seconds
+        :type sock_request_timeout: int
+        :param use_datanode_hostname: Use hostname instead of IP address to commuicate with datanodes
+        :type use_datanode_hostname: boolean
         '''
         self.use_trash = use_trash
         self.effective_user = effective_user
+        self.use_sasl = use_sasl
+        self.hdfs_namenode_principal = hdfs_namenode_principal
+        self.max_failovers = max_failovers
+        self.max_retries = max_retries
+        self.base_sleep = base_sleep
+        self.max_sleep = max_sleep
+        self.sock_connect_timeout = sock_connect_timeout
+        self.sock_request_timeout = sock_request_timeout
+        self.use_datanode_hostname = use_datanode_hostname
+
+        self.failovers = -1
+        self.retries = -1
 
         if not namenodes:
-            raise OutOfNNException("List of namenodes is empty - couldn't create the client")
+            # Using InvalidInputException instead of OutOfNNException because the later is transient but current case
+            # is not.
+            raise InvalidInputException("List of namenodes is empty - couldn't create the client")
         self.namenode = self._switch_namenode(namenodes)
         self.namenode.next()
 
-    def _switch_namenode(self, namenodes):
-        for namenode in namenodes:
-            log.debug("Switch to namenode: %s:%d" % (namenode.host, namenode.port))
-
-            yield super(HAClient, self).__init__(namenode.host,
-                                                 namenode.port,
-                                                 namenode.version,
-                                                 self.use_trash,
-                                                 self.effective_user)
-        else:
-            msg = "Request tried and failed for all %d namenodes: " % len(namenodes)
+    def _check_failover(self, namenodes):
+        if (self.failovers == -1):
+            return
+        elif (self.failovers >= self.max_failovers):
+            msg = "Request tried and failed for all %d namenodes after %d failovers: " % (len(namenodes), self.failovers)
             for namenode in namenodes:
                 msg += "\n\t* %s:%d" % (namenode.host, namenode.port)
             msg += "\nLook into debug messages - add -D flag!"
+            log.debug(msg)
             raise OutOfNNException(msg)
+        log.debug("Failover attempt %d:", self.failovers)
+        self.__do_retry_sleep(self.failovers)
+        self.failovers += 1
+
+    def _switch_namenode(self, namenodes):
+        while (True):
+            for namenode in namenodes:
+                self._check_failover(namenodes)
+                log.debug("Switch to namenode: %s:%d" % (namenode.host, namenode.port))
+                yield super(HAClient, self).__init__(namenode.host,
+                                                     namenode.port,
+                                                     namenode.version,
+                                                     self.use_trash,
+                                                     self.effective_user,
+                                                     self.use_sasl,
+                                                     self.hdfs_namenode_principal,
+                                                     self.sock_connect_timeout,
+                                                     self.sock_request_timeout,
+                                                     self.use_datanode_hostname)
+
+
+    def __calculate_exponential_time(self, time, retries, cap):
+        # Same calculation as the original Hadoop client but converted to seconds
+        baseTime = min(time * (1L << retries), cap);
+        return (baseTime * (random.random() + 0.5)) / 1000;
+
+    def __do_retry_sleep(self, retries):
+        # Don't wait for the first retry.
+        if (retries <= 0):
+            sleep_time = 0
+        else:
+            sleep_time = self.__calculate_exponential_time(self.base_sleep, retries, self.max_sleep)
+        log.debug("Doing retry sleep for %s seconds", sleep_time)
+        time.sleep(sleep_time)
+
+    def __should_retry(self):
+        if self.retries >= self.max_retries:
+            return False
+        else:
+            log.debug("Running retry %d of %d", self.retries, self.max_retries)
+            self.__do_retry_sleep(self.retries)
+            self.retries += 1
+            return True
 
     def __handle_request_error(self, exception):
         log.debug("Request failed with %s" % exception)
         if exception.args[0].startswith("org.apache.hadoop.ipc.StandbyException"):
-            pass
+            self.namenode.next() # Failover and retry until self.max_failovers was reached
+        elif exception.args[0].startswith("org.apache.hadoop.ipc.RetriableException") and self.__should_retry():
+            return
         else:
             # There's a valid NN in active state, but there's still request error - raise
+            # The Java Hadoop client does retry exceptions that are instance of IOException but
+            # not instance of RemoteException here. However some cases have an at most once flag
+            # thus we should not simply retry everything here. Let's fail it for now.
             raise
-        self.namenode.next()
 
     def __handle_socket_error(self, exception):
         log.debug("Request failed with %s" % exception)
         if exception.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH):
             # if NN is down or machine is not available, pass it:
-            pass
+            self.namenode.next() # Failover and retry until self.max_failovers was reached
         elif isinstance(exception, socket.timeout):
-            # if there's communication/socket timeout, pass it:
-            pass
+            self.namenode.next() # Failover and retry until self.max_failovers was reached
         else:
             raise
-        self.namenode.next()
 
     @staticmethod
     def _ha_return_method(func):
         ''' Method decorator for 'return type' methods '''
         def wrapped(self, *args, **kw):
+            self._reset_retries()
             while(True): # switch between all namenodes
                 try:
                     return func(self, *args, **kw)
@@ -1398,6 +1532,7 @@ class HAClient(Client):
     def _ha_gen_method(func):
         ''' Method decorator for 'generator type' methods '''
         def wrapped(self, *args, **kw):
+            self._reset_retries()
             while(True): # switch between all namenodes
                 try:
                     results = func(self, *args, **kw)
@@ -1412,10 +1547,12 @@ class HAClient(Client):
 HAClient._wrap_methods()
 
 class AutoConfigClient(HAClient):
-    ''' A pure python HDFS client that support HA and is auto configured through the ``HADOOP_PATH`` environment variable.
+    ''' A pure python HDFS client that support HA and is auto configured through the ``HADOOP_HOME`` environment variable.
 
     HAClient is fully backwards compatible with the vanilla Client and can be used for a non HA cluster as well.
-    This client tries to read ``${HADOOP_PATH}/conf/hdfs-site.xml`` to get the address of the namenode.
+    This client tries to read ``${HADOOP_HOME}/conf/hdfs-site.xml`` and ``${HADOOP_HOME}/conf/core-site.xml``
+    to get the address of the namenode.
+
     The behaviour is the same as Client.
 
     **Example:**
@@ -1429,16 +1566,24 @@ class AutoConfigClient(HAClient):
         Different Hadoop distributions use different protocol versions. Snakebite defaults to 9, but this can be set by passing
         in the ``hadoop_version`` parameter to the constructor.
     '''
-    def __init__(self, hadoop_version=Namenode.DEFAULT_VERSION, effective_user=None):
+    def __init__(self, hadoop_version=Namenode.DEFAULT_VERSION, effective_user=None, use_sasl=False):
         '''
         :param hadoop_version: What hadoop protocol version should be used (default: 9)
         :type hadoop_version: int
         :param effective_user: Effective user for the HDFS operations (default: None - current user)
         :type effective_user: string
+        :param use_sasl: Use SASL for authenication or not
+        :type use_sasl: boolean
         '''
 
         configs = HDFSConfig.get_external_config()
-        nns = [Namenode(c['namenode'], c['port'], hadoop_version) for c in configs]
+        nns = [Namenode(nn['namenode'], nn['port'], hadoop_version) for nn in configs['namenodes']]
         if not nns:
-            raise OutOfNNException("Tried and failed to find namenodes - couldn't created the client!")
-        super(AutoConfigClient, self).__init__(nns, HDFSConfig.use_trash, effective_user)
+            raise InvalidInputException("List of namenodes is empty - couldn't create the client")
+
+        super(AutoConfigClient, self).__init__(nns, configs.get('use_trash', False), effective_user,
+                                               configs.get('use_sasl', False), configs.get('hdfs_namenode_principal', None),
+                                               configs.get('failover_max_attempts'), configs.get('client_retries'),
+                                               configs.get('client_sleep_base_millis'), configs.get('client_sleep_max_millis'),
+                                               10000, configs.get('socket_timeout_millis'),
+                                               use_datanode_hostname=configs.get('use_datanode_hostname', False))

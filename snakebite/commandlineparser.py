@@ -14,9 +14,9 @@
 # the License.
 
 import argparse
+import errno
 import sys
 import os
-import pwd
 import json
 from urlparse import urlparse
 
@@ -34,6 +34,7 @@ from snakebite.formatter import format_du
 from snakebite.config import HDFSConfig
 from snakebite.version import version
 from snakebite.namenode import Namenode
+from snakebite.platformutils import get_current_username
 
 
 def print_error_exit(msg, fd=sys.stderr):
@@ -179,6 +180,8 @@ class CommandLineParser(object):
         self._build_parent_parser()
         self._add_subparsers()
         self.namenodes = []
+        self.user = None
+        self.use_sasl = False
 
     def _build_parent_parser(self):
         #general options
@@ -192,7 +195,7 @@ class CommandLineParser(object):
                     self.parser.add_argument(opt_data['short'], opt_data['long'], help=opt_data['help'], type=opt_data['type'])
 
     def _add_subparsers(self):
-        default_dir = os.path.join("/user", pwd.getpwuid(os.getuid())[0])
+        default_dir = os.path.join("/user", get_current_username())
 
         #sub-options
         arg_parsers = {}
@@ -265,6 +268,7 @@ class CommandLineParser(object):
         return self.args.port if self.args.port else alt
 
     def read_config(self):
+        self.configs = HDFSConfig.get_external_config()
 
         # Try to retrieve namenode config from within CL arguments
         if self._read_config_cl():
@@ -278,16 +282,15 @@ class CommandLineParser(object):
         elif os.path.exists('/etc/snakebiterc'):
             self._read_config_snakebiterc('/etc/snakebiterc')
         else:
-            # Try to read the configuration for HDFS configuration files
-            configs = HDFSConfig.get_external_config()
-            # if configs exist and contain something
-            if configs:
-                for config in configs:
+            # if configs from HDFS config files exist and contain something
+            if self.configs:
+                for config in self.configs['namenodes']:
                     nn = Namenode(config['namenode'],
                                   self.__use_cl_port_first(config['port']))
                     self.namenodes.append(nn)
                 if self.__usetrash_unset():
-                    self.args.usetrash = HDFSConfig.use_trash
+                    self.args.usetrash = self.configs['use_trash']
+                self.use_sasl = self.configs['use_sasl']
 
         if len(self.namenodes):
             return
@@ -312,7 +315,7 @@ class CommandLineParser(object):
             sys.exit(1)
 
     def _read_config_snakebiterc(self, path = os.path.join(os.path.expanduser('~'), '.snakebiterc')):
-        old_version_info = "You're are using snakebite %s with Trash support together with old snakebiterc, please update/remove your %s file. By default Trash is %s." % (path, version(), 'disabled' if not HDFSConfig.use_trash else 'enabled')
+        old_version_info = "You're are using snakebite %s with Trash support together with old snakebiterc, please update/remove your %s file. By default Trash is %s." % (path, version(), 'disabled' if not self.configs['use_trash'] else 'enabled')
         with open(path) as config_file:
             configs = json.load(config_file)
 
@@ -328,7 +331,7 @@ class CommandLineParser(object):
                 # commandline setting has higher priority
                 print_info(old_version_info)
                 # There's no info about Trash in version 1, use default policy:
-                self.args.usetrash = HDFSConfig.use_trash
+                self.args.usetrash = self.configs['use_trash']
         elif isinstance(configs, dict):
             # Version 2: {}
             # Can be either new configuration or just one namenode
@@ -343,7 +346,9 @@ class CommandLineParser(object):
 
                 if self.__usetrash_unset():
                     # commandline setting has higher priority
-                    self.args.usetrash = configs.get("use_trash", HDFSConfig.use_trash)
+                    self.args.usetrash = configs.get("use_trash", self.configs['use_trash'])
+
+                self.user = configs.get("user")
             else:
                 # config is a single namenode - no HA
                 self.namenodes.append(Namenode(configs['namenode'],
@@ -352,7 +357,7 @@ class CommandLineParser(object):
                 if self.__usetrash_unset():
                     # commandline setting has higher priority
                     print_info(old_version_info)
-                    self.args.usetrash = HDFSConfig.use_trash
+                    self.args.usetrash = self.configs['use_trash']
         else:
             print_error_exit("Config retrieved from %s is corrupted! Remove it!" % path)
 
@@ -401,7 +406,7 @@ class CommandLineParser(object):
             self.namenodes.append(Namenode(self.args.namenode, self.args.port))
             # we got the info from CL -> check if use_trash is set - if not use default policy:
             if self.__usetrash_unset():
-                self.args.usetrash = HDFSConfig.use_trash
+                self.args.usetrash = self.configs['use_trash']
             return True
         else:
             return False
@@ -438,7 +443,10 @@ class CommandLineParser(object):
             use_trash = self.args.usetrash and not self.args.skiptrash
         else:
             use_trash = self.args.usetrash
-        self.client = HAClient(self.namenodes, use_trash)
+        self.client = HAClient(self.namenodes, use_trash, self.user, self.use_sasl, self.configs['hdfs_namenode_principal'],
+                               self.configs['failover_max_attempts'], self.configs['client_retries'],
+                               self.configs['client_sleep_base_millis'], self.configs['client_sleep_max_millis'],
+                               self.configs['socket_timeout_millis'], use_datanode_hostname=self.configs['use_datanode_hostname'])
 
     def execute(self):
         if self.args.help:
@@ -450,6 +458,9 @@ class CommandLineParser(object):
             sys.exit(-1)
         try:
             return Commands.methods[self.cmd]['method'](self)
+        except IOError as e:
+            if e.errno != errno.EPIPE:
+                exitError(sys.exc_info())
         except Exception:
             exitError(sys.exc_info())
 

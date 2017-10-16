@@ -1,3 +1,94 @@
+snakebite (2.11.0) unstable; urgency=low
+
+  Support dfs.client.use.datanode.hostname config property
+
+ -- Wouter de Bie <wouter@spotify.com>  Fri, 8 Aug 2016 13:12:25 -0000
+
+snakebite (2.10.1) unstable; urgency=low
+
+  Revert "Add client retry for block read failures"
+
+ -- Wouter de Bie <wouter@spotify.com>  Fri, 14 Jul 2016 13:12:25 -0000
+
+snakebite (2.10.0) unstable; urgency=low
+
+  Add client retry for block read failures
+
+  Currently the client will fail on any block read errors even
+  though these might be transient failures. This patch enables
+  the client to retry block read failures to make it more
+  failure tolerant.
+
+ -- Wouter de Bie <wouter@spotify.com>  Fri, 13 Jul 2016 13:12:25 -0000
+
+snakebite (2.9.0) unstable; urgency=low
+
+  Add retry logic
+
+ -- Rafal Wojdyla <rav@spotify.com>  Tue, 17 May 2016 21:16:14 -0000
+
+snakebite (2.8.1) unstable; urgency=low
+
+   * Use InvalidInputException instead of OutOfNNException.
+
+ -- Wouter de Bie <wouter@spotify.com>  Fri, 4 Mar 2016 13:12:25 -0000
+
+snakebite (2.8.0) unstable; urgency=low
+
+   * Handle hdfs_namenode_principal properly and refactor auto configuration logic
+   * Common base class for exceptions; differentiating transient and fatal exceptions
+
+ -- Wouter de Bie <wouter@spotify.com>  Thu, 25 Feb 2016 13:12:25 -0000
+
+snakebite (2.7.3) unstable; urgency=low
+
+   * Add support for null checksum type. Fixes #87
+   * Start using posixpath where appropriate.
+
+ -- Wouter de Bie <wouter@spotify.com>  Mon, 23 Jan 2016 13:12:25 -0000
+
+snakebite (2.7.1) unstable; urgency=low
+
+   * Fix ISSUE-#167 by getting the kerberos principal from the hdfs config
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 1 Oct 2015 13:12:25 -0000
+
+snakebite (2.7.0) unstable; urgency=low
+
+   * Make kerberos/sasl optional in python packaging
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 24 Sep 2015 13:12:25 -0000
+
+snakebite (2.6.1) unstable; urgency=low
+
+   * Wraps use of the Python 'pwd' module in a utility procedure for Windows compatibility
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 28 Jul 2015 13:12:25 -0000
+
+snakebite (2.6.0) unstable; urgency=low
+
+   * Add SASL authentication
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 28 Jul 2015 11:12:25 -0000
+
+snakebite (2.5.6) unstable; urgency=low
+
+   * Add details to Exception when data_xciever.connect() fails.
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 4 Jul 2015 11:12:25 -0000
+
+snakebite (2.5.5) unstable; urgency=low
+
+   * Added tail length to the client.tail method
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 4 Jul 2015 11:10:25 -0000
+
+snakebite (2.5.4) unstable; urgency=low
+
+   * Handles broken pipe errors in snakebite commands #150
+
+ -- Wouter de Bie <wouter@spotify.com>  Tue, 5 May 2015 08:41:25 -0000
+
 snakebite (2.5.3) unstable; urgency=low
 
    * fix single_args problem for test/tail #149

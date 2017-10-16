@@ -41,7 +41,6 @@ May 2012
 # Standard library imports
 import socket
 import os
-import pwd
 import math
 
 # Third party imports
@@ -53,8 +52,9 @@ from snakebite.protobuf.IpcConnectionContext_pb2 import IpcConnectionContextProt
 from snakebite.protobuf.ProtobufRpcEngine_pb2 import RequestHeaderProto
 from snakebite.protobuf.datatransfer_pb2 import OpReadBlockProto, BlockOpResponseProto, PacketHeaderProto, ClientReadStatusProto
 
+from snakebite.platformutils import get_current_username
 from snakebite.formatter import format_bytes
-from snakebite.errors import RequestError
+from snakebite.errors import RequestError, TransientException, FatalException
 from snakebite.crc32c import crc
 
 import google.protobuf.internal.encoder as encoder
@@ -66,6 +66,14 @@ import logger
 import logging
 import struct
 import uuid
+
+_kerberos_available = False
+try:
+    from snakebite.rpc_sasl import SaslRpcClient
+    from snakebite.kerberos import Kerberos
+    _kerberos_available = True
+except ImportError:
+    pass
 
 # Configure package logging
 log = logger.getLogger(__name__)
@@ -131,7 +139,9 @@ class RpcBufferedReader(object):
                 log.debug("Bytes read: %d, total: %d" % (len(bytes_read), self.buffer_length))
                 return n
         if len(bytes_read) < n:
-            raise Exception("RpcBufferedReader only managed to read %s out of %s bytes" % (len(bytes_read), n))
+            # we'd like to distinguish transient (e.g. network-related) problems
+            # note: but this error could also be a logic error
+            raise TransientException("RpcBufferedReader only managed to read %s out of %s bytes" % (len(bytes_read), n))
 
     def rewind(self, places):
         '''Rewinds the current buffer to a position. Needed for reading varints,
@@ -156,13 +166,15 @@ class SocketRpcChannel(RpcChannel):
     RPC_HEADER = "hrpc"
     RPC_SERVICE_CLASS = 0x00
     AUTH_PROTOCOL_NONE = 0x00
+    AUTH_PROTOCOL_SASL = 0xDF
     RPC_PROTOCOL_BUFFFER = 0x02
 
 
     '''Socket implementation of an RpcChannel.
     '''
 
-    def __init__(self, host, port, version, effective_user=None):
+    def __init__(self, host, port, version, effective_user=None, use_sasl=False, hdfs_namenode_principal=None,
+                 sock_connect_timeout=10000, sock_request_timeout=10000):
         '''SocketRpcChannel to connect to a socket server on a user defined port.
            It possible to define version and effective user for the communication.'''
         self.host = host
@@ -171,14 +183,25 @@ class SocketRpcChannel(RpcChannel):
         self.call_id = -3  # First time (when the connection context is sent, the call_id should be -3, otherwise start with 0 and increment)
         self.version = version
         self.client_id = str(uuid.uuid4())
-        self.effective_user = effective_user or pwd.getpwuid(os.getuid())[0]
+        self.use_sasl = use_sasl
+        self.hdfs_namenode_principal = hdfs_namenode_principal
+        if self.use_sasl:
+            if not _kerberos_available:
+                raise FatalException("Kerberos libs not found. Please install snakebite using 'pip install snakebite[kerberos]'")
+
+            kerberos = Kerberos()
+            self.effective_user = effective_user or kerberos.user_principal().name
+        else: 
+            self.effective_user = effective_user or get_current_username()
+        self.sock_connect_timeout = sock_connect_timeout
+        self.sock_request_timeout = sock_request_timeout
 
     def validate_request(self, request):
         '''Validate the client request against the protocol file.'''
 
         # Check the request is correctly initialized
         if not request.IsInitialized():
-            raise Exception("Client request (%s) is missing mandatory fields" % type(request))
+            raise FatalException("Client request (%s) is missing mandatory fields" % type(request))
 
     def get_connection(self, host, port):
         '''Open a socket connection to a given host and port and writes the Hadoop header
@@ -206,15 +229,25 @@ class SocketRpcChannel(RpcChannel):
         # Open socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.sock.settimeout(10)
+        self.sock.settimeout(self.sock_connect_timeout / 1000)
         # Connect socket to server - defined by host and port arguments
         self.sock.connect((host, port))
+        self.sock.settimeout(self.sock_request_timeout / 1000)
 
         # Send RPC headers
         self.write(self.RPC_HEADER)                             # header
         self.write(struct.pack('B', self.version))              # version
         self.write(struct.pack('B', self.RPC_SERVICE_CLASS))    # RPC service class
-        self.write(struct.pack('B', self.AUTH_PROTOCOL_NONE))   # serialization type (protobuf = 0)
+        if self.use_sasl:
+            self.write(struct.pack('B', self.AUTH_PROTOCOL_SASL))   # serialization type (protobuf = 0xDF)
+        else:
+            self.write(struct.pack('B', self.AUTH_PROTOCOL_NONE))   # serialization type (protobuf = 0)
+
+        if self.use_sasl:
+            sasl = SaslRpcClient(self, hdfs_namenode_principal=self.hdfs_namenode_principal)
+            sasl_connected = sasl.connect()
+            if not sasl_connected:
+                raise TransientException("SASL is configured, but cannot get connected")
 
         rpc_header = self.create_rpc_request_header()
         context = self.create_connection_context()
@@ -459,7 +492,7 @@ class DataXceiverChannel(object):
 
     def _read_bytes(self, n, depth=0):
         if depth > self.MAX_READ_ATTEMPTS:
-            raise Exception("Tried to read %d more bytes, but failed after %d attempts" % (n, self.MAX_READ_ATTEMPTS))
+            raise TransientException("Tried to read %d more bytes, but failed after %d attempts" % (n, self.MAX_READ_ATTEMPTS))
 
         bytes = self.sock.recv(n)
         if len(bytes) < n:
@@ -548,10 +581,12 @@ class DataXceiverChannel(object):
         checksum_type = block_op_response.readOpChecksumInfo.checksum.type
         bytes_per_chunk = block_op_response.readOpChecksumInfo.checksum.bytesPerChecksum
         log.debug("Checksum type: %s, bytesPerChecksum: %s" % (checksum_type, bytes_per_chunk))
-        if checksum_type in [self.CHECKSUM_CRC32C, self.CHECKSUM_CRC32]:
+        if checksum_type in [self.CHECKSUM_NULL]:
+            checksum_len = 0
+        elif checksum_type in [self.CHECKSUM_CRC32C, self.CHECKSUM_CRC32]:
             checksum_len = 4
         else:
-            raise Exception("Checksum type %s not implemented" % checksum_type)
+            raise FatalException("Checksum type %s not implemented" % checksum_type)
 
         total_read = 0
         if block_op_response.status == 0:  # datatransfer_proto.Status.Value('SUCCESS')
@@ -580,7 +615,7 @@ class DataXceiverChannel(object):
                 byte_stream.reset()
 
                 # Collect checksums
-                if check_crc:
+                if check_crc and checksum_type != self.CHECKSUM_NULL:
                     checksums = []
                     for _ in xrange(0, chunks_per_packet):
                         checksum = self._read_bytes(checksum_len)
@@ -601,10 +636,11 @@ class DataXceiverChannel(object):
                         log.debug("Reading chunk %s in load %s:", j, i)
                         bytes_to_read = min(bytes_per_chunk, data_len - read_on_packet)
                         chunk = self._read_bytes(bytes_to_read)
-                        if check_crc:
+                        if check_crc and checksum_type != self.CHECKSUM_NULL:
                             checksum_index = i * chunks_per_load + j
                             if checksum_index < len(checksums) and crc(chunk) != checksums[checksum_index]:
-                                raise Exception("Checksum doesn't match")
+                                # it makes sense to retry, so TransientError
+                                raise TransientException("Checksum doesn't match")
                         load += chunk
                         total_read += len(chunk)
                         read_on_packet += len(chunk)

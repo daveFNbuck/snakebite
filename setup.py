@@ -44,6 +44,12 @@ install_requires = [
     'protobuf>2.4.1',
     'argparse']
 
+extras_require = {
+    'kerberos': [
+        'python-krbV',
+        'sasl']
+}
+
 tests_require = [
     'tox',
     'virtualenv>=1.11.2']
@@ -72,6 +78,7 @@ setup(
         ('', ['LICENSE'])
     ],
     install_requires=install_requires,
+    extras_require=extras_require,
     tests_require=tests_require,
     cmdclass={'test': Tox}
 )
